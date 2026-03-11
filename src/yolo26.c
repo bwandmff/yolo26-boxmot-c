@@ -1,14 +1,17 @@
 /*
  * yolo26.c - YOLO26 inference using ONNX Runtime
+ * 
+ * Compatible with ONNX Runtime 1.x C API
  */
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "yolo26.h"
 
-// Include ONNX Runtime headers
+// ONNX Runtime C API
 #include <onnxruntime_c_api.h>
 
 struct Yolo26Model {
@@ -27,99 +30,37 @@ struct Yolo26Model {
     // Preprocessing buffer
     uint8_t* resize_buffer;
     float* input_tensor;
+    
+    // ONNX API
+    const OrtApi* api;
 };
 
-static const char* get_error_message(OrtStatus* status) {
+static const char* get_error_message(const OrtApi* api, OrtStatus* status) {
     if (status == NULL) {
         return "Unknown error";
     }
-    return OrtGetErrorMessage(status);
+    return api->GetErrorMessage(status);
 }
 
-#define CHECK_STATUS(expr) \
+#define CHECK_STATUS(api, expr) \
     do { \
         OrtStatus* status = (expr); \
         if (status != NULL) { \
-            fprintf(stderr, "ONNX Error: %s\n", get_error_message(status)); \
-            OrtReleaseStatus(status); \
+            fprintf(stderr, "ONNX Error: %s\n", get_error_message(api, status)); \
+            api->ReleaseStatus(status); \
             return NULL; \
         } \
     } while(0)
 
-Yolo26Model* yolo26_init(const char* onnx_model_path, float conf_threshold, int num_classes) {
-    // Create ONNX environment
-    OrtEnv* env = NULL;
-    CHECK_STATUS(OrtCreateEnv(ORT_LOGGING_LEVEL_WARNING, "YOLO26", &env));
-    
-    // Create session options
-    OrtSessionOptions* session_options = NULL;
-    CHECK_STATUS(OrtCreateSessionOptions(&session_options));
-    
-    // Optimize for performance
-    CHECK_STATUS(OrtSessionOptionsSetGraphOptimizationLevel(
-        session_options, GRAPH_OPTIMIZATION_LEVEL_ENABLE));
-    
-    // Create session
-    OrtSession* session = NULL;
-    CHECK_STATUS(OrtCreateSession(env, onnx_model_path, session_options, &session));
-    
-    // Get input/output names
-    OrtAllocator* allocator = NULL;
-    CHECK_STATUS(OrtCreateDefaultAllocator(&allocator));
-    
-    char* input_name = NULL;
-    CHECK_STATUS(OrtSessionGetInputName(session, 0, allocator, &input_name));
-    
-    char* output_name = NULL;
-    CHECK_STATUS(OrtSessionGetOutputName(session, 0, allocator, &output_name));
-    
-    // Get input shape
-    OrtTypeInfo* input_type_info = NULL;
-    CHECK_STATUS(OrtSessionGetInputTypeInfo(session, 0, &input_type_info));
-    
-    const OrtTensorTypeAndShapeInfo* input_tensor_info = NULL;
-    CHECK_STATUS(OrtCastTypeInfoToTensorInfo(input_type_info, &input_tensor_info));
-    
-    size_t input_dims_count = 0;
-    CHECK_STATUS(OrtGetDimensions(input_tensor_info, NULL, &input_dims_count));
-    
-    int64_t* input_dims = (int64_t*)malloc(input_dims_count * sizeof(int64_t));
-    CHECK_STATUS(OrtGetDimensions(input_tensor_info, input_dims, input_dims_count));
-    
-    // Default input size (can be dynamic)
-    int input_width = 640;
-    int input_height = 640;
-    
-    if (input_dims_count >= 4) {
-        input_height = (int)input_dims[2];
-        input_width = (int)input_dims[3];
-    }
-    
-    OrtReleaseTypeInfo(input_type_info);
-    OrtReleaseAllocator(allocator);
-    
-    // Create model structure
-    Yolo26Model* model = (Yolo26Model*)malloc(sizeof(Yolo26Model));
-    if (!model) {
-        return NULL;
-    }
-    
-    model->env = env;
-    model->session = session;
-    model->session_options = session_options;
-    model->input_name = input_name;
-    model->output_name = output_name;
-    model->conf_threshold = conf_threshold;
-    model->num_classes = num_classes;
-    model->input_width = input_width;
-    model->input_height = input_height;
-    
-    // Allocate buffers
-    model->resize_buffer = (uint8_t*)malloc(input_width * input_height * 3);
-    model->input_tensor = (float*)malloc(1 * 3 * input_height * input_width * sizeof(float));
-    
-    return model;
-}
+#define CHECK_STATUS_NULL(api, expr) \
+    do { \
+        OrtStatus* status = (expr); \
+        if (status != NULL) { \
+            fprintf(stderr, "ONNX Error: %s\n", get_error_message(api, status)); \
+            api->ReleaseStatus(status); \
+            return NULL; \
+        } \
+    } while(0)
 
 static void letterbox_resize(const uint8_t* src, uint8_t* dst,
                             int src_w, int src_h, int dst_w, int dst_h) {
@@ -127,7 +68,7 @@ static void letterbox_resize(const uint8_t* src, uint8_t* dst,
     int new_w = (int)(src_w * scale);
     int new_h = (int)(src_h * scale);
     
-    // First resize with bilinear interpolation
+    // Bilinear interpolation
     for (int y = 0; y < dst_h; y++) {
         for (int x = 0; x < dst_w; x++) {
             float src_x = (x + 0.5f) / scale - 0.5f;
@@ -144,7 +85,7 @@ static void letterbox_resize(const uint8_t* src, uint8_t* dst,
             x1 = (x1 < 0) ? 0 : (x1 >= src_w) ? src_w - 1 : x1;
             y1 = (y1 < 0) ? 0 : (y1 >= src_h) ? src_h - 1 : y1;
             
-            // Bilinear interpolation weights
+            // Bilinear weights
             float wx1 = src_x - x0;
             float wy1 = src_y - y0;
             float wx0 = 1.0f - wx1;
@@ -166,11 +107,94 @@ static void letterbox_resize(const uint8_t* src, uint8_t* dst,
 }
 
 static void normalize_image(uint8_t* src, float* dst, int width, int height) {
-    // YOLO26 uses normalization to [0, 1] then ImageNet mean/std
-    // Simplified: just normalize to [0, 1]
     for (int i = 0; i < width * height * 3; i++) {
         dst[i] = src[i] / 255.0f;
     }
+}
+
+Yolo26Model* yolo26_init(const char* onnx_model_path, float conf_threshold, int num_classes) {
+    // Get ONNX Runtime API
+    const OrtApi* api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (api == NULL) {
+        fprintf(stderr, "Failed to get ONNX Runtime API\n");
+        return NULL;
+    }
+    
+    // Create environment
+    OrtEnv* env = NULL;
+    CHECK_STATUS(api, api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "YOLO26", &env));
+    
+    // Create session options
+    OrtSessionOptions* session_options = NULL;
+    CHECK_STATUS(api, api->CreateSessionOptions(&session_options));
+    
+    // Optimize for performance
+    CHECK_STATUS(api, api->SetGraphOptimizationLevel(
+        session_options, GRAPH_OPTIMIZATION_LEVEL_ENABLE));
+    
+    // Create session
+    OrtSession* session = NULL;
+    CHECK_STATUS(api, api->CreateSession(env, onnx_model_path, session_options, &session));
+    
+    // Get allocator
+    OrtAllocator* allocator = NULL;
+    CHECK_STATUS(api, api->GetDefaultAllocator(&allocator));
+    
+    // Get input name
+    char* input_name = NULL;
+    CHECK_STATUS(api, api->SessionGetInputName(session, 0, allocator, &input_name));
+    
+    // Get output name
+    char* output_name = NULL;
+    CHECK_STATUS(api, api->SessionGetOutputName(session, 0, allocator, &output_name));
+    
+    // Get input shape info
+    OrtTypeInfo* input_type_info = NULL;
+    CHECK_STATUS(api, api->SessionGetInputTypeInfo(session, 0, &input_type_info));
+    
+    const OrtTensorTypeAndShapeInfo* input_tensor_info = NULL;
+    CHECK_STATUS(api, api->CastTypeInfoToTensorInfo(input_type_info, &input_tensor_info));
+    
+    size_t input_dims_count = 0;
+    CHECK_STATUS(api, api->GetDimensions(input_tensor_info, NULL, &input_dims_count));
+    
+    int64_t* input_dims = (int64_t*)malloc(input_dims_count * sizeof(int64_t));
+    CHECK_STATUS(api, api->GetDimensions(input_tensor_info, input_dims, input_dims_count));
+    
+    // Default input size
+    int input_width = 640;
+    int input_height = 640;
+    
+    if (input_dims_count >= 4) {
+        input_height = (int)input_dims[2];
+        input_width = (int)input_dims[3];
+    }
+    
+    api->ReleaseTypeInfo(input_type_info);
+    free(input_dims);
+    
+    // Create model structure
+    Yolo26Model* model = (Yolo26Model*)malloc(sizeof(Yolo26Model));
+    if (!model) {
+        return NULL;
+    }
+    
+    model->api = api;
+    model->env = env;
+    model->session = session;
+    model->session_options = session_options;
+    model->input_name = input_name;
+    model->output_name = output_name;
+    model->conf_threshold = conf_threshold;
+    model->num_classes = num_classes;
+    model->input_width = input_width;
+    model->input_height = input_height;
+    
+    // Allocate buffers
+    model->resize_buffer = (uint8_t*)malloc(input_width * input_height * 3);
+    model->input_tensor = (float*)malloc(1 * 3 * input_height * input_width * sizeof(float));
+    
+    return model;
 }
 
 YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
@@ -178,6 +202,8 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
     if (!model || !image_data) {
         return NULL;
     }
+    
+    const OrtApi* api = model->api;
     
     // Preprocess: resize and normalize
     letterbox_resize(image_data, model->resize_buffer,
@@ -187,15 +213,13 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
     
     // Create input tensor
     int64_t input_shape[] = {1, 3, model->input_height, model->input_width};
-    size_t input_shape_len = sizeof(input_shape) / sizeof(input_shape[0]);
     
     OrtValue* input_tensor = NULL;
-    CHECK_STATUS_NULL(OrtCreateTensorWithDataAsOrtValue(
+    CHECK_STATUS_NULL(api, api->CreateTensorWithDataAsOrtValue(
         model->env,
         model->input_tensor,
         1 * 3 * model->input_height * model->input_width * sizeof(float),
-        input_shape,
-        input_shape_len,
+        input_shape, 4,
         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
         &input_tensor
     ));
@@ -205,7 +229,7 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
     const char* output_names[] = {model->output_name};
     
     OrtValue* output_tensor = NULL;
-    CHECK_STATUS_NULL(OrtRun(
+    CHECK_STATUS_NULL(api, api->Run(
         model->session,
         NULL,
         input_names,
@@ -216,26 +240,25 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
         &output_tensor
     ));
     
-    // Get output
+    // Get output data
     float* output_data = NULL;
-    CHECK_STATUS_NULL(OrtGetTensorData(output_tensor, (void**)&output_data));
+    CHECK_STATUS_NULL(api, api->GetTensorData(output_tensor, (void**)&output_data));
     
     // Get output shape
     OrtTypeInfo* output_type_info = NULL;
-    CHECK_STATUS_NULL(OrtSessionGetOutputTypeInfo(model->session, 0, &output_type_info));
+    CHECK_STATUS_NULL(api, api->SessionGetOutputTypeInfo(model->session, 0, &output_type_info));
     
     const OrtTensorTypeAndShapeInfo* output_tensor_info = NULL;
-    CHECK_STATUS_NULL(OrtCastTypeInfoToTensorInfo(output_type_info, &output_tensor_info));
+    CHECK_STATUS_NULL(api, api->CastTypeInfoToTensorInfo(output_type_info, &output_tensor_info));
     
     size_t output_dims_count = 0;
-    CHECK_STATUS_NULL(OrtGetDimensions(output_tensor_info, NULL, &output_dims_count));
+    CHECK_STATUS_NULL(api, api->GetDimensions(output_tensor_info, NULL, &output_dims_count));
     
     int64_t* output_dims = (int64_t*)malloc(output_dims_count * sizeof(int64_t));
-    CHECK_STATUS_NULL(OrtGetDimensions(output_tensor_info, output_dims, output_dims_count));
+    CHECK_STATUS_NULL(api, api->GetDimensions(output_tensor_info, output_dims, output_dims_count));
     
-    // Parse outputs - YOLO26 format: [batch, num_predictions, (x, y, w, h, obj, cls1, cls2, ...)]
+    // Parse outputs: [batch, num_predictions, (x, y, w, h, obj, cls1, cls2, ...)]
     size_t num_predictions = output_dims[1];
-    size_t num_values = num_predictions * (5 + model->num_classes);
     
     // Create detections
     YoloDetections* results = (YoloDetections*)malloc(sizeof(YoloDetections));
@@ -243,7 +266,7 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
     results->detections = (YoloDetection*)malloc(sizeof(YoloDetection) * num_predictions);
     results->count = 0;
     
-    // Scale factors for converting to original image size
+    // Scale factors
     float scale_x = (float)width / model->input_width;
     float scale_y = (float)height / model->input_height;
     
@@ -271,7 +294,7 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
             continue;
         }
         
-        // Convert from center format to corner format
+        // Convert from center to corner format
         float cx = pred[0] * scale_x;
         float cy = pred[1] * scale_y;
         float w = pred[2] * scale_x;
@@ -302,9 +325,9 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
     
     // Cleanup
     free(output_dims);
-    OrtReleaseValue(output_tensor);
-    OrtReleaseValue(input_tensor);
-    OrtReleaseTypeInfo(output_type_info);
+    api->ReleaseValue(output_tensor);
+    api->ReleaseValue(input_tensor);
+    api->ReleaseTypeInfo(output_type_info);
     
     return results;
 }
@@ -327,11 +350,11 @@ void yolo26_destroy(Yolo26Model* model) {
     
     if (model->resize_buffer) free(model->resize_buffer);
     if (model->input_tensor) free(model->input_tensor);
-    if (model->input_name) OrtFree(model->input_name);
-    if (model->output_name) OrtFree(model->output_name);
-    if (model->session) OrtReleaseSession(model->session);
-    if (model->session_options) OrtReleaseSessionOptions(model->session_options);
-    if (model->env) OrtReleaseEnv(model->env);
+    if (model->input_name) model->api->ReleaseAllocator(model->input_name);
+    if (model->output_name) model->api->ReleaseAllocator(model->output_name);
+    if (model->session) model->api->ReleaseSession(model->session);
+    if (model->session_options) model->api->ReleaseSessionOptions(model->session_options);
+    if (model->env) model->api->ReleaseEnv(model->env);
     
     free(model);
 }
