@@ -25,13 +25,6 @@ typedef struct {
     int history_size;
 } ByteTrack;
 
-// Track array
-typedef struct {
-    ByteTrack* tracks;
-    size_t count;
-    size_t capacity;
-} ByteTracks;
-
 // Tracking parameters
 typedef struct {
     float track_thresh;      // Threshold for new track
@@ -40,6 +33,26 @@ typedef struct {
     float min_box_area;    // Minimum box area
     int max_time_lost;     // Max frames lost before removing
 } ByteTrackConfig;
+
+// ByteTrack tracker structure
+typedef struct ByteTrackTracker {
+    ByteTrackConfig config;
+    
+    // Active tracks
+    ByteTrack* tracks;
+    size_t track_count;
+    size_t track_capacity;
+    
+    // Lost tracks buffer
+    ByteTrack* lost_tracks;
+    size_t lost_count;
+    size_t lost_capacity;
+    
+    int next_track_id;
+} ByteTrackTracker;
+
+// For backward compatibility
+typedef ByteTrackTracker ByteTracks;
 
 // Default configuration
 ByteTrackConfig bytetrack_default_config(void);
