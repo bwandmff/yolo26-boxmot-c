@@ -14,15 +14,15 @@ BIN_DIR = .
 OPENCV_CFLAGS = $(shell pkg-config --cflags opencv4 2>/dev/null || pkg-config --cflags opencv 2>/dev/null)
 OPENCV_LIBS = $(shell pkg-config --libs opencv4 2>/dev/null || pkg-config --libs opencv 2>/dev/null)
 
-# ONNX Runtime
-ONNX_CFLAGS = -I/usr/local/include
-ONNX_LIBS = -L/usr/local/lib -lonnxruntime
+# ONNX Runtime - use local copy if available
+ONNX_LOCAL = onnxruntime-linux-x64-1.15.1
 
-# If ONNX Runtime not installed, use system paths
-ONNX_CFLAGS_SYSTEM = $(shell ls -d /usr/include/onnxruntime* 2>/dev/null | head -1)
-ifneq ($(ONNX_CFLAGS_SYSTEM),)
-    ONNX_CFLAGS = -I$(ONNX_CFLAGS_SYSTEM)
-    ONNX_LIBS = $(shell ls /usr/lib/libonnxruntime* 2>/dev/null | head -1 | sed 's/^/-l/')
+ifeq ($(shell test -d $(ONNX_LOCAL) && echo yes),yes)
+    ONNX_CFLAGS = -I$(ONNX_LOCAL)/include
+    ONNX_LIBS = -L$(ONNX_LOCAL)/lib -lonnxruntime
+else
+    ONNX_CFLAGS = -I/usr/local/include
+    ONNX_LIBS = -L/usr/local/lib -lonnxruntime
 endif
 
 # Flags
