@@ -49,15 +49,15 @@ $(BUILD_DIR):
 
 # Link
 $(TARGET): $(OBJECTS)
-	$(CC) $^ -o $@ $(OPENCV_LIBS) $(ONNX_LIBS) -lm -lpthread -ldl
+	$(CXX) $^ -o $@ $(OPENCV_LIBS) $(ONNX_LIBS) -lm -lpthread -ldl
 
-# Compile source files
+# Compile source files (use g++ for OpenCV compatibility)
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(DEPS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Compile main
+# Compile main (use g++ for OpenCV compatibility)
 $(BUILD_DIR)/main.o: $(SRC_DIR)/main.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Add main.o to OBJECTS
 OBJECTS += $(BUILD_DIR)/main.o

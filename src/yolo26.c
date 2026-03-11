@@ -1,7 +1,7 @@
 /*
  * yolo26.c - YOLO26 inference using ONNX Runtime
  * 
- * Compatible with ONNX Runtime 1.x C API
+ * Compatible with ONNX Runtime 1.3.0+ C API
  */
 
 #include <stdlib.h>
@@ -18,6 +18,7 @@ struct Yolo26Model {
     OrtEnv* env;
     OrtSession* session;
     OrtSessionOptions* session_options;
+    OrtAllocator* allocator;
     
     char* input_name;
     char* output_name;
@@ -39,7 +40,8 @@ static const char* get_error_message(const OrtApi* api, OrtStatus* status) {
     if (status == NULL) {
         return "Unknown error";
     }
-    return api->GetErrorMessage(status);
+    const char* msg = api->GetErrorMessage(status);
+    return msg ? msg : "Unknown error";
 }
 
 #define CHECK_STATUS(api, expr) \
@@ -65,8 +67,11 @@ static const char* get_error_message(const OrtApi* api, OrtStatus* status) {
 static void letterbox_resize(const uint8_t* src, uint8_t* dst,
                             int src_w, int src_h, int dst_w, int dst_h) {
     float scale = fminf((float)dst_w / src_w, (float)dst_h / src_h);
+    (void)scale;
     int new_w = (int)(src_w * scale);
     int new_h = (int)(src_h * scale);
+    (void)new_w;
+    (void)new_h;
     
     // Bilinear interpolation
     for (int y = 0; y < dst_h; y++) {
@@ -129,8 +134,8 @@ Yolo26Model* yolo26_init(const char* onnx_model_path, float conf_threshold, int 
     CHECK_STATUS(api, api->CreateSessionOptions(&session_options));
     
     // Optimize for performance
-    CHECK_STATUS(api, api->SetGraphOptimizationLevel(
-        session_options, GRAPH_OPTIMIZATION_LEVEL_ENABLE));
+    CHECK_STATUS(api, api->SetSessionGraphOptimizationLevel(
+        session_options, ORT_ENABLE_ALL));
     
     // Create session
     OrtSession* session = NULL;
@@ -138,7 +143,7 @@ Yolo26Model* yolo26_init(const char* onnx_model_path, float conf_threshold, int 
     
     // Get allocator
     OrtAllocator* allocator = NULL;
-    CHECK_STATUS(api, api->GetDefaultAllocator(&allocator));
+    CHECK_STATUS(api, api->GetAllocatorWithDefaultOptions(&allocator));
     
     // Get input name
     char* input_name = NULL;
@@ -155,9 +160,11 @@ Yolo26Model* yolo26_init(const char* onnx_model_path, float conf_threshold, int 
     const OrtTensorTypeAndShapeInfo* input_tensor_info = NULL;
     CHECK_STATUS(api, api->CastTypeInfoToTensorInfo(input_type_info, &input_tensor_info));
     
+    // Get dimensions count first
     size_t input_dims_count = 0;
-    CHECK_STATUS(api, api->GetDimensions(input_tensor_info, NULL, &input_dims_count));
+    CHECK_STATUS(api, api->GetDimensionsCount(input_tensor_info, &input_dims_count));
     
+    // Allocate and get dimensions
     int64_t* input_dims = (int64_t*)malloc(input_dims_count * sizeof(int64_t));
     CHECK_STATUS(api, api->GetDimensions(input_tensor_info, input_dims, input_dims_count));
     
@@ -178,11 +185,12 @@ Yolo26Model* yolo26_init(const char* onnx_model_path, float conf_threshold, int 
     if (!model) {
         return NULL;
     }
-    
+
     model->api = api;
     model->env = env;
     model->session = session;
     model->session_options = session_options;
+    model->allocator = allocator;
     model->input_name = input_name;
     model->output_name = output_name;
     model->conf_threshold = conf_threshold;
@@ -199,6 +207,7 @@ Yolo26Model* yolo26_init(const char* onnx_model_path, float conf_threshold, int 
 
 YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
                              int width, int height, int channels) {
+    (void)channels;
     if (!model || !image_data) {
         return NULL;
     }
@@ -214,15 +223,20 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
     // Create input tensor
     int64_t input_shape[] = {1, 3, model->input_height, model->input_width};
     
+    OrtMemoryInfo* memory_info = NULL;
+    CHECK_STATUS_NULL(api, api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info));
+    
     OrtValue* input_tensor = NULL;
     CHECK_STATUS_NULL(api, api->CreateTensorWithDataAsOrtValue(
-        model->env,
+        memory_info,
         model->input_tensor,
         1 * 3 * model->input_height * model->input_width * sizeof(float),
         input_shape, 4,
         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
         &input_tensor
     ));
+    
+    api->ReleaseMemoryInfo(memory_info);
     
     // Run inference
     const char* input_names[] = {model->input_name};
@@ -242,7 +256,7 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
     
     // Get output data
     float* output_data = NULL;
-    CHECK_STATUS_NULL(api, api->GetTensorData(output_tensor, (void**)&output_data));
+    CHECK_STATUS_NULL(api, api->GetTensorMutableData(output_tensor, (void**)&output_data));
     
     // Get output shape
     OrtTypeInfo* output_type_info = NULL;
@@ -251,8 +265,9 @@ YoloDetections* yolo26_detect(Yolo26Model* model, const uint8_t* image_data,
     const OrtTensorTypeAndShapeInfo* output_tensor_info = NULL;
     CHECK_STATUS_NULL(api, api->CastTypeInfoToTensorInfo(output_type_info, &output_tensor_info));
     
+    // Get dimensions count
     size_t output_dims_count = 0;
-    CHECK_STATUS_NULL(api, api->GetDimensions(output_tensor_info, NULL, &output_dims_count));
+    CHECK_STATUS_NULL(api, api->GetDimensionsCount(output_tensor_info, &output_dims_count));
     
     int64_t* output_dims = (int64_t*)malloc(output_dims_count * sizeof(int64_t));
     CHECK_STATUS_NULL(api, api->GetDimensions(output_tensor_info, output_dims, output_dims_count));
@@ -350,8 +365,8 @@ void yolo26_destroy(Yolo26Model* model) {
     
     if (model->resize_buffer) free(model->resize_buffer);
     if (model->input_tensor) free(model->input_tensor);
-    if (model->input_name) model->api->ReleaseAllocator(model->input_name);
-    if (model->output_name) model->api->ReleaseAllocator(model->output_name);
+    if (model->input_name) model->allocator->Free(model->allocator, model->input_name);
+    if (model->output_name) model->allocator->Free(model->allocator, model->output_name);
     if (model->session) model->api->ReleaseSession(model->session);
     if (model->session_options) model->api->ReleaseSessionOptions(model->session_options);
     if (model->env) model->api->ReleaseEnv(model->env);
